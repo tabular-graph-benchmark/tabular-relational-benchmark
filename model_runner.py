@@ -2,6 +2,7 @@ import importlib.util
 import logging
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Callable, Dict
 
@@ -101,6 +102,8 @@ class ModelRunner:
 		model_path = self.available_models[model_group][model_name]
 		spec = importlib.util.spec_from_file_location(model_name, model_path)
 		module = importlib.util.module_from_spec(spec)
+		# Register module in sys.modules before execution to support @dataclass and other introspective decorators
+		sys.modules[model_name] = module
 		spec.loader.exec_module(module)
 		return module
 
@@ -174,6 +177,7 @@ class ModelRunner:
 					raise ValueError(f"No runnable function found in model: {model_name}")
 		except Exception as e:
 			logger.error("Error while running model %s: %s", model_name, str(e))
+			logger.error("Full traceback:\n%s", traceback.format_exc())
 			return {
 				"model": model_name,
 				"error": str(e),

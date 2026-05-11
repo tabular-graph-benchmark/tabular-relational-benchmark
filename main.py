@@ -160,9 +160,9 @@ def parse_args():
     )
 
     # Experiment setup
-    parser.add_argument("--train_ratio", type=float, default=0.80, help="Train split ratio")
+    parser.add_argument("--train_ratio", type=float, default=0.05, help="Train split ratio")
     parser.add_argument("--val_ratio", type=float, default=0.15, help="Validation split ratio")
-    parser.add_argument("--test_ratio", type=float, default=0.05, help="Test split ratio")
+    parser.add_argument("--test_ratio", type=float, default=0.80, help="Test split ratio")
     parser.add_argument("--few_shot", action="store_true", help="Enable few-shot setting")
     parser.add_argument(
         "--few_shot_ratio",
@@ -246,7 +246,7 @@ def parse_args():
     # Misc
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--gpu", type=int, default=0, help="GPU id (-1 for CPU)")
-    parser.add_argument("--output_dir", type=str, default="./result", help="Output directory")
+    parser.add_argument("--output_dir", type=str, default="./results", help="Output directory")
     parser.add_argument(
         "--exp_name",
         type=str,
@@ -502,7 +502,21 @@ def run_experiment(args):
                     exp_cfg = dict(experiment_config)
                     exp_cfg["graphify"] = graphify_mode
 
-                    for gnn_stage in gnn_stages_to_test:
+                    # Stage aliasing to avoid redundant runs.
+                    # Some backbones do not have a distinct semantic meaning for certain stages.
+                    # For example, ResNet has no explicit "columnwise-interaction" blocks, so
+                    # `columnwise` is equivalent to `encoding` for GNN injection.
+                    stage_aliases: dict[str, str] = {}
+                    effective_stages: list[str] = []
+                    for _stage in gnn_stages_to_test:
+                        stage_norm = str(_stage).lower()
+                        if model_name == "resnet" and stage_norm == "columnwise":
+                            stage_aliases["columnwise"] = "encoding"
+                            stage_norm = "encoding"
+                        if stage_norm not in effective_stages:
+                            effective_stages.append(stage_norm)
+
+                    for gnn_stage in effective_stages:
                         logger.info(
                             "Testing model %s with graphify=%s at stage %s",
                             model_name,
@@ -519,7 +533,8 @@ def run_experiment(args):
                             # Optimization: avoid rerunning identical configurations when
                             # `--graphify all` is used.
                             #
-                            # For ExcelFormer in this port, the following are equivalent:
+                            # For backbones where feature-level graphification is inactive at
+                            # start/materialize, the following are equivalent:
                             #   - (graphify=row, gnn_stage=none)
                             #   - (graphify=feature, gnn_stage in {none,start,materialize})
                             #
@@ -551,7 +566,7 @@ def run_experiment(args):
                                     aliased["error"] = src.get("error")
 
                                 logger.info(
-                                    "Aliasing excelformer metrics for graphify=feature stage %s from row/none",
+                                    "Aliasing baseline metrics for graphify=feature stage %s from row/none",
                                     str(gnn_stage).lower(),
                                 )
                                 model_results[graphify_mode][gnn_stage] = aliased
@@ -571,6 +586,35 @@ def run_experiment(args):
                             model_results[graphify_mode][gnn_stage] = result
                             if "best_test_metric" in result:
                                 print(f"[RESULT] Best test metric: {result['best_test_metric']}")
+
+                            # Materialize stage aliases after the source stage is available.
+                            if (
+                                model_name == "resnet"
+                                and "columnwise" in stage_aliases
+                                and stage_aliases.get("columnwise") in model_results[graphify_mode]
+                            ):
+                                src_key = stage_aliases["columnwise"]
+                                src = model_results[graphify_mode][src_key]
+                                if isinstance(src, dict):
+                                    aliased = {
+                                        "best_val_metric": src.get("best_val_metric"),
+                                        "best_test_metric": src.get("best_test_metric"),
+                                        "early_stop_epochs": src.get("early_stop_epochs"),
+                                        "gnn_early_stop_epochs": src.get("gnn_early_stop_epochs", 0),
+                                        "elapsed_time": 0.0,
+                                        "copied_from": f"{src_key}",
+                                    }
+                                    if "error" in src:
+                                        aliased["error"] = src.get("error")
+
+                                    logger.info(
+                                        "Aliasing stage %s for model %s (graphify=%s) from %s",
+                                        "columnwise",
+                                        model_name,
+                                        graphify_mode,
+                                        src_key,
+                                    )
+                                    model_results[graphify_mode]["columnwise"] = aliased
                         except Exception as e:
                             logger.error(
                                 "Error running model %s (graphify=%s) at stage %s: %s",
@@ -580,6 +624,35 @@ def run_experiment(args):
                                 str(e),
                             )
                             model_results[graphify_mode][gnn_stage] = {"error": str(e)}
+
+                    # If the user requested only `columnwise` (no explicit `encoding`), we still
+                    # run `encoding` once and then alias `columnwise` to keep summary shape stable.
+                    if model_name == "resnet" and "columnwise" in stage_aliases:
+                        src_key = stage_aliases["columnwise"]
+                        if (
+                            "columnwise" not in model_results[graphify_mode]
+                            and src_key in model_results[graphify_mode]
+                            and isinstance(model_results[graphify_mode][src_key], dict)
+                        ):
+                            src = model_results[graphify_mode][src_key]
+                            aliased = {
+                                "best_val_metric": src.get("best_val_metric"),
+                                "best_test_metric": src.get("best_test_metric"),
+                                "early_stop_epochs": src.get("early_stop_epochs"),
+                                "gnn_early_stop_epochs": src.get("gnn_early_stop_epochs", 0),
+                                "elapsed_time": 0.0,
+                                "copied_from": f"{src_key}",
+                            }
+                            if "error" in src:
+                                aliased["error"] = src.get("error")
+                            logger.info(
+                                "Aliasing stage %s for model %s (graphify=%s) from %s",
+                                "columnwise",
+                                model_name,
+                                graphify_mode,
+                                src_key,
+                            )
+                            model_results[graphify_mode]["columnwise"] = aliased
 
             dataset_results["models"][model_name] = model_results
 
